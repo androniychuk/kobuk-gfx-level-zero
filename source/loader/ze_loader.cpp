@@ -1,6 +1,6 @@
 /*
  *
- * Copyright (C) 2019-2021 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -18,6 +18,10 @@
 
 namespace loader
 {
+    ze_handle_t* loaderDispatch = nullptr;
+    ze_dditable_t* loaderZeDdiTable = nullptr;
+    zet_dditable_t* loaderZetDdiTable = nullptr;
+    zes_dditable_t* loaderZesDdiTable = nullptr;
     ///////////////////////////////////////////////////////////////////////////////
     context_t *context;
 
@@ -73,29 +77,10 @@ namespace loader
         permissiveDesc.stype = ZE_STRUCTURE_TYPE_INIT_DRIVER_TYPE_DESC;
         permissiveDesc.pNext = nullptr;
         permissiveDesc.flags = UINT32_MAX;
+        if (sysmanOnly) {
+            return true; // Sorting not fully supported by the spec due to missing zesDriverGetProperties for sysman drivers.
+        }
         for (auto &driver : *drivers) {
-            if (sysmanOnly) {
-                for (auto &coreDriver : this->zeDrivers) {
-                    if (coreDriver.name == driver.name) {
-                        if (!driver.dditable.ze.Global.pfnInitDrivers) {
-                            driver.dditable.ze.Global.pfnInitDrivers = coreDriver.dditable.ze.Global.pfnInitDrivers;
-                        }
-                        if (!driver.dditable.ze.Driver.pfnGet) {
-                            driver.dditable.ze.Driver.pfnGet = coreDriver.dditable.ze.Driver.pfnGet;
-                        }
-                        if (!driver.dditable.ze.Driver.pfnGetProperties) {
-                            driver.dditable.ze.Driver.pfnGetProperties = coreDriver.dditable.ze.Driver.pfnGetProperties;
-                        }
-                        if (!driver.dditable.ze.Device.pfnGet) {
-                            driver.dditable.ze.Device.pfnGet = coreDriver.dditable.ze.Device.pfnGet;
-                        }
-                        if (!driver.dditable.ze.Device.pfnGetProperties) {
-                            driver.dditable.ze.Device.pfnGetProperties = coreDriver.dditable.ze.Device.pfnGetProperties;
-                        }
-                        break;
-                    }
-                }
-            }
             uint32_t pCount = 0;
             std::vector<ze_driver_handle_t> driverHandles;
             ze_result_t res = ZE_RESULT_SUCCESS;
@@ -172,10 +157,13 @@ namespace loader
             }
 
             for (auto handle : driverHandles) {
-                ze_driver_properties_t properties = {};
-                properties.stype = ZE_STRUCTURE_TYPE_DRIVER_PROPERTIES;
-                properties.pNext = nullptr;
-                ze_result_t res = driver.dditable.ze.Driver.pfnGetProperties(handle, &properties);
+                driver.properties = {};
+                driver.properties.stype = ZE_STRUCTURE_TYPE_DRIVER_DDI_HANDLES_EXT_PROPERTIES;
+                driver.properties.pNext = nullptr;
+                ze_driver_properties_t driverProperties = {};
+                driverProperties.stype = ZE_STRUCTURE_TYPE_DRIVER_PROPERTIES;
+                driverProperties.pNext = &driver.properties;
+                ze_result_t res = driver.dditable.ze.Driver.pfnGetProperties(handle, &driverProperties);
                 if (res != ZE_RESULT_SUCCESS) {
                     if (debugTraceEnabled) {
                         std::string message = "driverSorting " + driver.name + " failed, zeDriverGetProperties returned ";
@@ -183,7 +171,7 @@ namespace loader
                     }
                     continue;
                 }
-                driver.properties = properties;
+                driver.driverDDIHandleSupportQueried = true;
                 uint32_t deviceCount = 0;
                 res = driver.dditable.ze.Device.pfnGet( handle, &deviceCount, nullptr );
                 if( ZE_RESULT_SUCCESS != res ) {
@@ -457,7 +445,21 @@ namespace loader
         if (driverEnvironmentQueried) {
             return ZE_RESULT_SUCCESS;
         }
+        loader::loaderDispatch = new ze_handle_t();
+        loader::loaderDispatch->pCore = new ze_dditable_driver_t();
+        loader::loaderDispatch->pCore->version = ZE_API_VERSION_CURRENT;
+        loader::loaderDispatch->pCore->isValidFlag = 1;
+        loader::loaderDispatch->pTools = new zet_dditable_driver_t();
+        loader::loaderDispatch->pTools->version = ZE_API_VERSION_CURRENT;
+        loader::loaderDispatch->pTools->isValidFlag = 1;
+        loader::loaderDispatch->pSysman = new zes_dditable_driver_t();
+        loader::loaderDispatch->pSysman->version = ZE_API_VERSION_CURRENT;
+        loader::loaderDispatch->pSysman->isValidFlag = 1;
+        loader::loaderZeDdiTable = new ze_dditable_t();
+        loader::loaderZetDdiTable = new zet_dditable_t();
+        loader::loaderZesDdiTable = new zes_dditable_t();
         debugTraceEnabled = getenv_tobool( "ZE_ENABLE_LOADER_DEBUG_TRACE" );
+        driverDDIPathDefault = getenv_tobool( "ZE_ENABLE_LOADER_DRIVER_DDI_PATH" );
         auto discoveredDrivers = discoverEnabledDrivers();
         std::string loadLibraryErrorValue;
 
@@ -661,7 +663,13 @@ namespace loader
                 }
             }
         }
-
+        if (loader::loaderDispatch) {
+            loader_driver_ddi::zeDestroyDDiDriverTables(loader::loaderDispatch->pCore);
+            loader_driver_ddi::zetDestroyDDiDriverTables(loader::loaderDispatch->pTools);
+            loader_driver_ddi::zesDestroyDDiDriverTables(loader::loaderDispatch->pSysman);
+            delete loader::loaderDispatch;
+            loader::loaderDispatch = nullptr;
+        }
     };
 
     void context_t::add_loader_version(){
